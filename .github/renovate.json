@@ -29,6 +29,9 @@
       "matchDepNames": [
         "quay.io/aipcc/base-images/cpu"
       ],
+      "schedule": [
+        "at any time"
+      ],
       "versioning": "semver",
       "enabled": true
     }
