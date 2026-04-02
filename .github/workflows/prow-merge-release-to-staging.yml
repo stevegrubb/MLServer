@@ -2,9 +2,16 @@ name: Prow Merge release-* Branch to rhoai-staging Branch
 
 on:
   workflow_dispatch:
+
+# Prevent concurrent sync runs for the same source branch.
+# We queue instead of canceling to avoid losing a manually-triggered run.
+concurrency:
+  group: sync-${{ github.ref }}
+  cancel-in-progress: false
         
 env:
   RELEASE_BRANCH: ${{ github.ref_name }}
+  TARGET_BRANCH: rhoai-staging
 
 permissions:
   contents: write
@@ -12,54 +19,109 @@ permissions:
 
 jobs:
   auto-merge:
+    # Only release-* branches are allowed to trigger this sync flow.
     if: startsWith(github.ref, 'refs/heads/release-')
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        # Pinned from actions/checkout v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           ref: master
           fetch-depth: 0
       - name: Fetch required branches
         run: |
-          git fetch origin rhoai-staging
+          set -o nounset
+          set -o pipefail
+
+          # Fetch both branch tips used throughout validation and merge.
+          git fetch origin "$TARGET_BRANCH"
           git fetch origin $RELEASE_BRANCH
+
+          # Fail early with clear logs if expected refs are missing.
+          if ! git rev-parse --verify "origin/$TARGET_BRANCH" >/dev/null 2>&1; then
+            echo "Required branch not found: origin/$TARGET_BRANCH"
+            exit 1
+          fi
+          if ! git rev-parse --verify "origin/$RELEASE_BRANCH" >/dev/null 2>&1; then
+            echo "Required branch not found: origin/$RELEASE_BRANCH"
+            exit 1
+          fi
       - name: Validate Sync Status
         id: validate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Check if there is any open sync PR from this release branch
+          set -o nounset
+          set -o pipefail
+
+          # Block duplicate in-flight sync PRs from the same release branch.
           EXISTING_PR=$(gh pr list \
-            --base "rhoai-staging" \
+            --base "$TARGET_BRANCH" \
             --json number,headRefName \
             --jq ".[] | select(.headRefName | startswith(\"sync/${RELEASE_BRANCH}\")) | .number" \
             | head -n1)
           if [ -n "$EXISTING_PR" ]; then
-            echo "PR #$EXISTING_PR already exists for syncing $RELEASE_BRANCH to rhoai-staging."
-            echo "Please close any outstanding syncs from $RELEASE_BRANCH to rhoai-staging before proceeding."
+            echo "PR #$EXISTING_PR already exists for syncing $RELEASE_BRANCH to $TARGET_BRANCH."
+            echo "Please close any outstanding syncs from $RELEASE_BRANCH to $TARGET_BRANCH before proceeding."
             exit 1
           fi
 
-          # Check if there are any changes to sync (excluding release workflow files)
-          if ! git diff --quiet \
-            "origin/rhoai-staging..origin/$RELEASE_BRANCH" \
-            -- . \
-            ':!.tekton/mlserver-push.yaml' \
-            ':!.github/workflows/prow-merge-release-to-staging.yml' \
-            ':!.github/workflows/create-and-bump-tag.yml'; then
-            echo "Changes detected between $RELEASE_BRANCH and rhoai-staging. Proceeding with PR creation."
+          # Decide whether a sync is needed after applying the same policy rules
+          # used in the merge step (excluded files and keep-from-rhoai files).
+          MEANINGFUL_CHANGES=false
+
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+
+            # Always excluded from sync
+            if [[ "$file" == ".tekton/mlserver-push.yaml" ]] || \
+               [[ "$file" == ".github/workflows/prow-merge-release-to-staging.yml" ]] || \
+               [[ "$file" == ".github/workflows/create-and-bump-tag.yml" ]]; then
+              continue
+            fi
+
+            # Root-level metadata kept from rhoai-staging by policy.
+            # NOTE: bare filenames are root-path matches; runtime files are handled
+            # by explicit runtimes/* patterns below.
+            if [[ "$file" == "pyproject.toml" ]] || \
+               [[ "$file" == "poetry.lock" ]] || \
+               [[ "$file" == "docs/conf.py" ]] || \
+               [[ "$file" == "mlserver/version.py" ]] || \
+               [[ "$file" == runtimes/*/pyproject.toml ]] || \
+               [[ "$file" == runtimes/*/poetry.lock ]]; then
+              continue
+            fi
+
+            # Runtime version files are branch-owned when they already exist on
+            # $TARGET_BRANCH. New runtime version files on release are meaningful
+            # and should be synced into $TARGET_BRANCH.
+            if [[ "$file" == runtimes/*/*/version.py ]]; then
+              if git cat-file -e "origin/$TARGET_BRANCH:$file" 2>/dev/null; then
+                continue
+              fi
+            fi
+
+            MEANINGFUL_CHANGES=true
+            break
+          done < <(git diff --name-only "origin/$TARGET_BRANCH..origin/$RELEASE_BRANCH")
+
+          if [ "$MEANINGFUL_CHANGES" = true ]; then
+            echo "Meaningful changes detected between $RELEASE_BRANCH and $TARGET_BRANCH. Proceeding with PR creation."
             echo "has_changes=true" >> $GITHUB_OUTPUT
           else
-            echo "No changes to sync from $RELEASE_BRANCH to rhoai-staging (excluding release workflow files)."
-            echo "The branches are already in sync."
+            echo "No meaningful changes to sync from $RELEASE_BRANCH to $TARGET_BRANCH after applying sync policy."
             echo "has_changes=false" >> $GITHUB_OUTPUT
           fi
-      - name: Sync ${{ github.ref_name }} to rhoai-staging
+      - name: Sync ${{ github.ref_name }} to ${{ env.TARGET_BRANCH }}
         if: steps.validate.outputs.has_changes == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -o nounset
+          set -o pipefail
+
           # Generate sync branch name with timestamp
           SYNC_BRANCH="sync/${RELEASE_BRANCH}-$(date +%Y-%m-%d-%H%M%S)"
           
@@ -67,13 +129,24 @@ jobs:
           git config user.name "Sync Bot"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Create new branch from current HEAD (rhoai-staging)
-          git checkout -b "$SYNC_BRANCH" origin/rhoai-staging
+          # Create new sync branch from origin/$TARGET_BRANCH.
+          git checkout -b "$SYNC_BRANCH" "origin/$TARGET_BRANCH"
 
-          # Perform the merge to maintain commit history
-          git merge --no-edit "origin/$RELEASE_BRANCH"
+          # Start merge without committing yet. This lets us apply policy changes
+          # first so the final PR contains one deterministic merge commit.
+          set +e
+          git merge --no-commit --no-ff -X theirs "origin/$RELEASE_BRANCH"
+          MERGE_EXIT=$?
+          set -e
 
-          # Exclude release workflow files by restoring them from rhoai-staging or removing them
+          # Distinguish expected conflict state (MERGE_HEAD exists) from fatal
+          # merge failures where no merge state was created.
+          if [ "$MERGE_EXIT" -ne 0 ] && ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            echo "Merge failed unexpectedly with exit code $MERGE_EXIT and no MERGE_HEAD."
+            exit 1
+          fi
+
+          # Always keep these files in target-branch shape (or absent if absent on target branch).
           FILES_TO_EXCLUDE=(
             ".tekton/mlserver-push.yaml"
             ".github/workflows/prow-merge-release-to-staging.yml"
@@ -81,22 +154,84 @@ jobs:
           )
 
           for file in "${FILES_TO_EXCLUDE[@]}"; do
-            if git ls-tree -r origin/rhoai-staging --name-only | grep -q "^${file}$"; then
-              # File exists on rhoai-staging, restore it
-              echo "Restoring $file from rhoai-staging"
-              git checkout origin/rhoai-staging -- "$file"
+            if git cat-file -e "origin/$TARGET_BRANCH:$file" 2>/dev/null; then
+              # File exists on target branch, restore it
+              echo "Restoring $file from $TARGET_BRANCH"
+              git restore --source "origin/$TARGET_BRANCH" --staged --worktree -- "$file"
             else
-              # File doesn't exist on rhoai-staging, remove it
-              if [ -f "$file" ]; then
-                echo "Removing $file (not present on rhoai-staging)"
-                git rm "$file"
-              fi
+              # File doesn't exist on target branch, remove it
+              echo "Removing $file (not present on $TARGET_BRANCH)"
+              git rm -f --ignore-unmatch "$file"
             fi
           done
 
-          # Commit the exclusions if there are changes
-          if ! git diff --quiet --cached; then
-            git commit -m "Exclude release workflow files from sync"
+          # Apply metadata ownership policy:
+          # - Keep root/runtime dependency metadata from target branch.
+          # - Keep existing runtime version.py from target branch.
+          # - For newly introduced runtime version.py on release, keep release version.
+          # This mirrors files managed by hack/update-version.sh.
+          # Iterate remote-ref branch diff (not merge-index state) for deterministic policy.
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+
+            case "$file" in
+              # Dependency metadata and version tracking files.
+              pyproject.toml|poetry.lock|docs/conf.py|mlserver/version.py|runtimes/*/pyproject.toml|runtimes/*/poetry.lock)
+                if git cat-file -e "origin/$TARGET_BRANCH:$file" 2>/dev/null; then
+                  echo "Keeping $file from $TARGET_BRANCH"
+                  git restore --source "origin/$TARGET_BRANCH" --staged --worktree -- "$file"
+                else
+                  echo "Removing $file (not present on $TARGET_BRANCH)"
+                  git rm -f --ignore-unmatch "$file"
+                fi
+                ;;
+
+              runtimes/*/*/version.py)
+                if git cat-file -e "origin/$TARGET_BRANCH:$file" 2>/dev/null; then
+                  echo "Keeping $file from $TARGET_BRANCH"
+                  git restore --source "origin/$TARGET_BRANCH" --staged --worktree -- "$file"
+                else
+                  echo "::warning::Runtime version file '$file' exists only on release branch. Keeping release version to allow new runtime sync."
+                  # If this file is unmerged, resolve conflict by taking release side.
+                  if [ -n "$(git ls-files -u -- "$file")" ]; then
+                    git checkout --theirs -- "$file"
+                  fi
+                  git add "$file"
+                fi
+                ;;
+            esac
+          done < <(git diff --name-only "origin/$TARGET_BRANCH..origin/$RELEASE_BRANCH")
+
+          # Do not continue if any unresolved conflicts remain after policy handling.
+          if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            UNRESOLVED_CONFLICTS=$(git diff --name-only --diff-filter=U)
+            if [ -n "$UNRESOLVED_CONFLICTS" ]; then
+              echo "Merge returned exit code: $MERGE_EXIT"
+              echo "Unresolved merge conflicts remain:"
+              echo "$UNRESOLVED_CONFLICTS"
+              echo "Please resolve conflicts manually and fix the merge conflict."
+              exit 1
+            fi
+          fi
+
+          # No-op check:
+          # - first diff checks worktree vs index
+          # - second diff checks index vs HEAD (merge result before commit)
+          # If both are clean, policy neutralized the merge and we can stop.
+          if git diff --quiet && git diff --quiet --cached; then
+            echo "No effective changes remain after sync policy; skipping push and PR creation."
+            if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+              git merge --abort || true
+            fi
+            exit 0
+          fi
+
+          # Finalize exactly one merge commit for this sync PR.
+          if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            git commit --no-edit
+          else
+            echo "Expected MERGE_HEAD to exist before final commit, but it was missing."
+            exit 1
           fi
 
           # Push the sync branch
@@ -104,12 +239,12 @@ jobs:
 
           # Create new PR
           gh pr create \
-            --base "rhoai-staging" \
+            --base "$TARGET_BRANCH" \
             --head "$SYNC_BRANCH" \
-            --title "Sync $RELEASE_BRANCH to rhoai-staging" \
+            --title "Sync $RELEASE_BRANCH to $TARGET_BRANCH" \
             --body "$(cat <<EOF
           ## Description
-          - Automated sync of changes from $RELEASE_BRANCH to rhoai-staging
+          - Automated sync of changes from $RELEASE_BRANCH to $TARGET_BRANCH
           - Part of RHOAI release preparation
 
           ## Changes
@@ -118,6 +253,7 @@ jobs:
             - \`.tekton/mlserver-push.yaml\`
             - \`.github/workflows/prow-merge-release-to-staging.yml\`
             - \`.github/workflows/create-and-bump-tag.yml\`
+          - Version and dependency metadata files are preserved from \`$TARGET_BRANCH\` by sync policy.
 
           🤖 Generated with GitHub Actions
           EOF
