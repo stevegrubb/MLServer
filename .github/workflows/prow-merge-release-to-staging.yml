@@ -2,6 +2,17 @@ name: Prow Merge release-* Branch to rhoai-staging Branch
 
 on:
   workflow_dispatch:
+    inputs:
+      confirm_pyproject_sync_policy:
+        description: |
+          Developer Note: release-* -> rhoai-staging auto-sync does not auto-propagate all pyproject.toml updates as-is.
+          If pyproject.toml or runtimes/*/pyproject.toml changes are needed in rhoai-staging, open a separate manual sync PR.
+          After manual pyproject sync, regenerate lock files with `make lock`.
+
+          Acknowledgement: I understand and will manually sync pyproject.toml changes when needed.
+        required: false
+        type: boolean
+        default: false
 
 # Prevent concurrent sync runs for the same source branch.
 # We queue instead of canceling to avoid losing a manually-triggered run.
@@ -24,6 +35,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: Validate manual pyproject sync acknowledgement
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.confirm_pyproject_sync_policy != 'true' }}
+        run: |
+          echo "Please acknowledge pyproject.toml manual sync policy before running this workflow."
+          exit 1
+
       - name: Checkout repository
         # Pinned from actions/checkout v6
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
