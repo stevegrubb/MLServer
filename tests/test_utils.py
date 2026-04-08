@@ -9,8 +9,10 @@ from mlserver.utils import (
     get_model_uri,
     extract_headers,
     insert_headers,
+    get_normalized_version,
     install_uvloop_event_loop,
 )
+from mlserver.version import __version__
 from mlserver.types import InferenceRequest, InferenceResponse, Parameters
 from mlserver.settings import ModelSettings, ModelParameters
 from .fixtures import SumModel
@@ -101,6 +103,22 @@ def _check_uvloop_availability():
     except ImportError:  # pragma: no cover
         avail = False
     return avail
+
+
+@pytest.mark.parametrize(
+    "version, expected",
+    [
+        ("1.7.1+rhaiv.8", "1.7.1"),
+        ("1.7.1", "1.7.1"),
+        ("1.7.0.dev0", "1.7.0.dev0"),
+    ],
+)
+def test_get_normalized_version(version: Optional[str], expected: str):
+    assert get_normalized_version(version) == expected
+
+
+def test_get_normalized_version_default_uses_current_version():
+    assert get_normalized_version() == __version__.split("+", 1)[0]
 
 
 def test_uvloop_auto_install():

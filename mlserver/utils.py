@@ -10,6 +10,7 @@ from .logging import logger
 from .types import InferenceRequest, InferenceResponse, Parameters
 from .settings import ModelSettings
 from .errors import InvalidModelURI
+from .version import __version__
 
 
 async def get_model_uri(
@@ -134,3 +135,16 @@ def schedule_with_callback(coro, cb) -> Task:
     task = asyncio.create_task(coro)
     task.add_done_callback(cb)
     return task
+
+
+def get_normalized_version(version: Optional[str] = None) -> str:
+    """
+    Return a public version string without local build metadata.
+
+    Example:
+    - 1.7.1+rhaiv.8 -> 1.7.1
+    - 1.7.1 -> 1.7.1
+    - 1.7.0.dev0 -> 1.7.0.dev0
+    """
+    resolved_version = version or __version__
+    return resolved_version.split("+", 1)[0]

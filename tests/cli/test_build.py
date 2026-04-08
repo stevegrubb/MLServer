@@ -10,7 +10,7 @@ from pytest_cases import fixture, parametrize_with_cases
 from pathlib import Path
 from typing import Tuple, Optional
 
-from mlserver import __version__
+from mlserver.utils import get_normalized_version
 from mlserver.repository import DEFAULT_MODEL_SETTINGS_FILENAME
 from mlserver.repository.load import load_model_settings
 from mlserver.types import InferenceRequest, Parameters
@@ -147,7 +147,7 @@ def test_generate_dockerfile(base_image: Optional[str]):
     else:
         dockerfile = generate_dockerfile(base_image=base_image)
 
-    expected = base_image.format(version=__version__)
+    expected = base_image.format(version=get_normalized_version())
     assert expected in dockerfile
 
     # Verify the trusted runtime section is present
@@ -262,7 +262,7 @@ def test_generate_dockerfile_dev_mode():
     assert "{trusted_runtime_allowlist_json}" not in dockerfile
 
     # Should have base image
-    expected_base = DefaultBaseImage.format(version=__version__)
+    expected_base = DefaultBaseImage.format(version=get_normalized_version())
     assert expected_base in dockerfile
 
     # Should have standard CMD

@@ -8,12 +8,12 @@ from tempfile import TemporaryDirectory
 from pathlib import Path
 from typing import Optional
 
-from .. import __version__
 from ..logging import logger
 from ..settings import (
     ALLOWED_MODEL_IMPLEMENTATIONS,
     TRUSTED_RUNTIMES_ARTIFACT_PATH,
 )
+from ..utils import get_normalized_version
 from ._runtime_utils import (
     calculate_runtime_requirements,
     collect_runtime_declaration_issues,
@@ -137,7 +137,7 @@ def generate_dockerfile(
     dev: bool = False,
 ) -> str:
     """Generate a Dockerfile with trusted runtime allowlist and copy steps."""
-    base_image = base_image.format(version=__version__)
+    base_image = base_image.format(version=get_normalized_version())
 
     if dev:
         # Development mode: no trusted runtimes allowlist file, no custom runtime paths
