@@ -80,12 +80,12 @@ RUN --mount=type=bind,from=wheel-builder,src=/opt/mlserver/dist,target=./dist \
     ln -sf /usr/bin/pip${PYTHON_VERSION} /usr/bin/pip3 && \
     ln -sf /usr/bin/pip${PYTHON_VERSION} /usr/bin/pip &&\
     pip install --upgrade pip wheel setuptools && \
+    pip install $(ls "./dist/mlserver-"*.whl) --constraint ./dist/constraints.txt && \
     for _runtime in $RUNTIMES; do \
         _wheel="./dist/mlserver_$_runtime-"*.whl; \
         echo "--> Installing $_wheel..."; \
         pip install $_wheel --constraint ./dist/constraints.txt; \
     done && \
-    pip install $(ls "./dist/mlserver-"*.whl) --constraint ./dist/constraints.txt && \
     rm -rf /root/.cache/pip
 
 COPY ./licenses/license.txt .
